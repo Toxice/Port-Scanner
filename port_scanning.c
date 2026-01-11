@@ -17,19 +17,20 @@
 #include <netdb.h>
 #include <time.h>
 #include <signal.h>
+#include <net/if.h>
+#include <ifaddrs.h>
 
 #define MIN_PORT 1
 #define MAX_PORT 65535
 #define BUFFER_SIZE 4096
-#define TIMEOUT 2000  // 2 second timeout per port
+#define TIMEOUT 2000
 #define PACKET_SIZE 4096
 #define MAX_OPEN_PORTS 1024
+#define TRACKING_SIZE 1000  // Increased from 100
 
-// Scan types
 #define SCAN_TCP 1
 #define SCAN_UDP 2
 
-// Port status
 #define PORT_CLOSED 0
 #define PORT_OPEN 1
 #define PORT_FILTERED 2
@@ -46,28 +47,22 @@ typedef struct {
     struct udphdr udp;
 } udp_packet;
 
-/**
- * @brief Structure to track each port scan
- */
 typedef struct {
     int port;
     uint16_t src_port;
     uint32_t seq_num;
     struct timeval time_sent;
-    int received;  // Flag if we got a response
+    int received;
 } port_info_t;
 
-/**
- * @brief Shared memory structure for inter-process communication
- */
 typedef struct {
-    int current_port;           // Current port being scanned
-    int sender_done;            // Flag indicating sender finished
-    int open_ports[MAX_OPEN_PORTS]; // Array of open ports
-    int open_count;             // Number of open ports found
-    int scan_type;              // TCP or UDP
-    port_info_t port_tracking[100]; // Track last 100 ports for validation
-    int tracking_index;         // Circular buffer index
+    int current_port;
+    int sender_done;
+    int open_ports[MAX_OPEN_PORTS];
+    int open_count;
+    int scan_type;
+    port_info_t port_tracking[TRACKING_SIZE];
+    int tracking_index;
 } scan_state_t;
 
 scan_state_t *shared_state = NULL;
@@ -76,9 +71,42 @@ int sock_send = -1;
 int sock_recv_tcp = -1;
 int sock_recv_icmp = -1;
 char target_ip[INET_ADDRSTRLEN];
+char local_ip[INET_ADDRSTRLEN];
 
 /**
- * @brief Calculate checksum for ICMP header
+ * @brief Get local IP address for the interface that would route to target
+ */
+int get_local_ip(const char *target, char *local) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in target_addr;
+    memset(&target_addr, 0, sizeof(target_addr));
+    target_addr.sin_family = AF_INET;
+    target_addr.sin_port = htons(53);  // DNS port
+    inet_pton(AF_INET, target, &target_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr*)&target_addr, sizeof(target_addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    struct sockaddr_in local_addr;
+    socklen_t addr_len = sizeof(local_addr);
+    if (getsockname(sock, (struct sockaddr*)&local_addr, &addr_len) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    inet_ntop(AF_INET, &local_addr.sin_addr, local, INET_ADDRSTRLEN);
+    close(sock);
+    return 0;
+}
+
+/**
+ * @brief Calculate checksum for IP/ICMP header
  */
 unsigned short checksum(void *b, int len) {
     uint16_t *buffer = b;
@@ -100,7 +128,7 @@ unsigned short checksum(void *b, int len) {
 }
 
 /**
- * @brief Calculate TCP/UDP checksum with pseudo-header (The Interent Checksum)
+ * @brief Calculate TCP/UDP checksum with pseudo-header
  */
 unsigned short transport_checksum(struct iphdr *ip_header, void *transport_header, 
                                   int transport_len, int protocol) {
@@ -132,13 +160,11 @@ int resolve_host(const char *host, char *ip_addr) {
     struct hostent *he;
     struct in_addr **addr_list;
 
-    // Check if it's already an IP address
     if (inet_pton(AF_INET, host, ip_addr) == 1) {
         strcpy(ip_addr, host);
         return 0;
     }
 
-    // Try to resolve hostname
     if ((he = gethostbyname(host)) == NULL) {
         return -1;
     }
@@ -156,7 +182,7 @@ int resolve_host(const char *host, char *ip_addr) {
  * @brief Find port info in tracking array
  */
 port_info_t* find_port_info(int dest_port) {
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < TRACKING_SIZE; i++) {
         if (shared_state->port_tracking[i].port == dest_port && 
             shared_state->port_tracking[i].received == 0) {
             return &shared_state->port_tracking[i];
@@ -179,28 +205,31 @@ int send_tcp_syn(int port) {
         return -1;
     }
 
-    // Build TCP SYN packet
     memset(&packet, 0, sizeof(packet));
 
     // IP header
     packet.ip.version = 4;
     packet.ip.ihl = 5;
     packet.ip.tos = 0;
-    packet.ip.tot_len = sizeof(tcp_packet);
+    packet.ip.tot_len = htons(sizeof(tcp_packet));  // FIX: Convert to network byte order
     packet.ip.id = htons(getpid() + port);
     packet.ip.frag_off = 0;
     packet.ip.ttl = 64;
     packet.ip.protocol = IPPROTO_TCP;
     packet.ip.check = 0;
-    packet.ip.saddr = 0; // Kernel fills this
+    
+    // FIX: Set source IP address
+    inet_pton(AF_INET, local_ip, &packet.ip.saddr);
     inet_pton(AF_INET, target_ip, &packet.ip.daddr);
+    
+    // FIX: Calculate IP checksum
+    packet.ip.check = checksum(&packet.ip, sizeof(struct iphdr));
 
-    // TCP header - generate unique source port
+    // TCP header
     uint16_t src_port = 12345 + (port % 10000);
     packet.tcp.source = htons(src_port);
     packet.tcp.dest = htons(port);
     
-    // Generate sequence number
     uint32_t seq_num = rand();
     packet.tcp.seq = htonl(seq_num);
     packet.tcp.ack_seq = 0;
@@ -210,20 +239,18 @@ int send_tcp_syn(int port) {
     packet.tcp.check = 0;
     packet.tcp.urg_ptr = 0;
 
-    // Calculate TCP checksum
     packet.tcp.check = transport_checksum(&packet.ip, &packet.tcp, 
                                          sizeof(struct tcphdr), IPPROTO_TCP);
 
-    // Store port tracking info before sending
-    int idx = shared_state->tracking_index % 100;
+    // Store port tracking info
+    int idx = shared_state->tracking_index % TRACKING_SIZE;
     shared_state->port_tracking[idx].port = port;
     shared_state->port_tracking[idx].src_port = src_port;
     shared_state->port_tracking[idx].seq_num = seq_num;
     gettimeofday(&shared_state->port_tracking[idx].time_sent, NULL);
     shared_state->port_tracking[idx].received = 0;
-    shared_state->tracking_index = (shared_state->tracking_index + 1) % 100;
+    shared_state->tracking_index = (shared_state->tracking_index + 1) % TRACKING_SIZE;
 
-    // Send SYN packet
     if (sendto(sock_send, &packet, sizeof(packet), 0, 
                (struct sockaddr*)&dest, sizeof(dest)) < 0) {
         return -1;
@@ -246,20 +273,21 @@ void send_tcp_reset(int dest_port, uint16_t src_port, uint32_t seq_num, uint32_t
 
     memset(&packet, 0, sizeof(packet));
 
-    // IP header
     packet.ip.version = 4;
     packet.ip.ihl = 5;
     packet.ip.tos = 0;
-    packet.ip.tot_len = sizeof(tcp_packet);
+    packet.ip.tot_len = htons(sizeof(tcp_packet));  // FIX
     packet.ip.id = htons(getpid() + dest_port);
     packet.ip.frag_off = 0;
     packet.ip.ttl = 64;
     packet.ip.protocol = IPPROTO_TCP;
     packet.ip.check = 0;
-    packet.ip.saddr = 0;
+    
+    inet_pton(AF_INET, local_ip, &packet.ip.saddr);
     inet_pton(AF_INET, target_ip, &packet.ip.daddr);
+    
+    packet.ip.check = checksum(&packet.ip, sizeof(struct iphdr));
 
-    // TCP RST/ACK packet
     packet.tcp.source = htons(src_port);
     packet.tcp.dest = htons(dest_port);
     packet.tcp.seq = htonl(seq_num + 1);
@@ -292,42 +320,39 @@ int send_udp_packet(int port) {
         return -1;
     }
 
-    // Build UDP packet
     memset(&packet, 0, sizeof(packet));
 
-    // IP header
     packet.ip.version = 4;
     packet.ip.ihl = 5;
     packet.ip.tos = 0;
-    packet.ip.tot_len = sizeof(udp_packet);
+    packet.ip.tot_len = htons(sizeof(udp_packet));  // FIX
     packet.ip.id = htons(getpid() + port);
     packet.ip.frag_off = 0;
     packet.ip.ttl = 64;
     packet.ip.protocol = IPPROTO_UDP;
     packet.ip.check = 0;
-    packet.ip.saddr = 0;
+    
+    inet_pton(AF_INET, local_ip, &packet.ip.saddr);
     inet_pton(AF_INET, target_ip, &packet.ip.daddr);
+    
+    packet.ip.check = checksum(&packet.ip, sizeof(struct iphdr));
 
-    // UDP header
     uint16_t src_port = 12345 + (port % 10000);
     packet.udp.source = htons(src_port);
     packet.udp.dest = htons(port);
     packet.udp.len = htons(sizeof(struct udphdr));
     packet.udp.check = 0;
 
-    // Calculate UDP checksum
     packet.udp.check = transport_checksum(&packet.ip, &packet.udp,
                                          sizeof(struct udphdr), IPPROTO_UDP);
 
-    // Store tracking info
-    int idx = shared_state->tracking_index % 100;
+    int idx = shared_state->tracking_index % TRACKING_SIZE;
     shared_state->port_tracking[idx].port = port;
     shared_state->port_tracking[idx].src_port = src_port;
     gettimeofday(&shared_state->port_tracking[idx].time_sent, NULL);
     shared_state->port_tracking[idx].received = 0;
-    shared_state->tracking_index = (shared_state->tracking_index + 1) % 100;
+    shared_state->tracking_index = (shared_state->tracking_index + 1) % TRACKING_SIZE;
 
-    // Send UDP packet
     if (sendto(sock_send, &packet, sizeof(packet), 0,
                (struct sockaddr*)&dest, sizeof(dest)) < 0) {
         return -1;
@@ -336,92 +361,62 @@ int send_udp_packet(int port) {
     return 0;
 }
 
-/**
- * @brief Display TCP scan results for a received packet
- * @details Processes TCP response packets, determines port status,
- *          and prints appropriate output to the screen
- * 
- * @param buffer Buffer containing the received packet
- * @param bytes Number of bytes received
- */
 void display_tcp(char *buffer, int bytes) {
     char src_addr[INET_ADDRSTRLEN];
     
-    // Validate minimum packet size
     if (bytes < (int)sizeof(struct iphdr)) {
         return;
     }
 
-    // Extract IP header
     struct iphdr *ip_resp = (struct iphdr*)buffer;
     
-    // Verify it's from our target
     inet_ntop(AF_INET, &(ip_resp->saddr), src_addr, INET_ADDRSTRLEN);
     
     if (strcmp(src_addr, target_ip) != 0) {
         return;
     }
     
-    // Validate we have enough data for TCP header
     if (bytes < (int)(ip_resp->ihl * 4 + sizeof(struct tcphdr))) {
         return;
     }
     
-    // Extract TCP header
     struct tcphdr *tcp_resp = (struct tcphdr*)(buffer + ip_resp->ihl * 4);
     int dest_port = ntohs(tcp_resp->source);
     
-    // Find this port in our tracking
     port_info_t *port_info = find_port_info(dest_port);
     
     if (port_info != NULL && port_info->received == 0) {
         if (tcp_resp->syn && tcp_resp->ack) {
-            // SYN/ACK = port is OPEN
             if (shared_state->open_count < MAX_OPEN_PORTS) {
                 shared_state->open_ports[shared_state->open_count++] = dest_port;
                 printf("Port %d/tcp is open\n", dest_port);
                 fflush(stdout);
             }
             
-            // Mark as received
             port_info->received = 1;
             
-            // Send RST to close connection gracefully
             send_tcp_reset(dest_port, port_info->src_port, 
                        port_info->seq_num, ntohl(tcp_resp->seq) + 1);
         } else if (tcp_resp->rst) {
-            // RST = port is CLOSED (no output)
             port_info->received = 1;
         }
     }
 }
 
-/**
- * @brief Display UDP scan results for a received ICMP packet
- * @details Processes ICMP Port Unreachable messages to determine
- *          which UDP ports are closed
- * 
- * @param buffer Buffer containing the received ICMP packet
- * @param bytes Number of bytes received
- */
 void display_udp(char *buffer, int bytes) {
-    // Validate minimum packet size
     if (bytes < (int)sizeof(struct iphdr)) {
         return;
     }
 
     struct iphdr *ip_resp = (struct iphdr*)buffer;
     
-    // Validate we have enough data for ICMP header
     if (bytes < (int)(ip_resp->ihl * 4 + sizeof(struct icmphdr))) {
         return;
     }
     
     struct icmphdr *icmp_resp = (struct icmphdr*)(buffer + ip_resp->ihl * 4);
 
-    // ICMP Type 3 Code 3 = Port Unreachable = CLOSED
     if (icmp_resp->type == 3 && icmp_resp->code == 3) {
-        // Extract original packet to verify it's for our port
         int offset = ip_resp->ihl * 4 + sizeof(struct icmphdr);
         
         if (bytes < offset + (int)sizeof(struct iphdr)) {
@@ -437,7 +432,6 @@ void display_udp(char *buffer, int bytes) {
         struct udphdr *orig_udp = (struct udphdr*)(buffer + offset + orig_ip->ihl * 4);
         int dest_port = ntohs(orig_udp->dest);
         
-        // Mark port as closed (received ICMP unreachable)
         port_info_t *port_info = find_port_info(dest_port);
         if (port_info != NULL) {
             port_info->received = 1;
@@ -445,83 +439,60 @@ void display_udp(char *buffer, int bytes) {
     }
 }
 
-/**
- * @brief Listener process - receives and processes responses
- * @details Continuously monitors for incoming packets and delegates
- *          processing to appropriate display functions based on scan type
- */
 void listener() {
     unsigned char buffer[BUFFER_SIZE];
     struct pollfd fds[2];
     int nfds = 0;
 
-    // Setup poll for TCP socket (if TCP scan)
     if (shared_state->scan_type == SCAN_TCP && sock_recv_tcp >= 0) {
         fds[nfds].fd = sock_recv_tcp;
         fds[nfds].events = POLLIN;
         nfds++;
     }
 
-    // Setup poll for ICMP socket (if UDP scan)
     if (shared_state->scan_type == SCAN_UDP && sock_recv_icmp >= 0) {
         fds[nfds].fd = sock_recv_icmp;
         fds[nfds].events = POLLIN;
         nfds++;
     }
 
-    // Continuously listen for responses
     while (1) {
-        // Exit when sender is done and we've waited enough for straggler packets
         if (shared_state->sender_done) {
-            // Give extra time for late responses
             sleep(3);
             break;
         }
 
-        int poll_result = poll(fds, nfds, 100); // 100ms timeout for responsiveness
+        int poll_result = poll(fds, nfds, 100);
 
         if (poll_result < 0) {
             perror("poll error");
             continue;
         } else if (poll_result == 0) {
-            // Timeout - just continue listening
             continue;
         }
 
-        // Process TCP responses
-        if (shared_state->scan_type == SCAN_TCP && (fds[0].revents & POLLIN)) {
-            struct sockaddr_in from;
-            socklen_t fromlen = sizeof(from);
+        for (int i = 0; i < nfds; i++) {
+            if (fds[i].revents & POLLIN) {
+                struct sockaddr_in from;
+                socklen_t fromlen = sizeof(from);
+                memset(buffer, 0, sizeof(buffer));
 
-            memset(buffer, 0, sizeof(buffer));
+                int bytes = recvfrom(fds[i].fd, buffer, sizeof(buffer), 0,
+                                    (struct sockaddr*)&from, &fromlen);
 
-            int bytes = recvfrom(sock_recv_tcp, buffer, sizeof(buffer), 0,
-                                (struct sockaddr*)&from, &fromlen);
-
-            if (bytes > 0) {
-                display_tcp((char*)buffer, bytes);
-            }
-        }
-
-        // Process ICMP responses (for UDP)
-        if (shared_state->scan_type == SCAN_UDP && nfds > 0 && (fds[0].revents & POLLIN)) {
-            struct sockaddr_in from;
-            socklen_t fromlen = sizeof(from);
-
-            memset(buffer, 0, sizeof(buffer));
-
-            int bytes = recvfrom(sock_recv_icmp, buffer, sizeof(buffer), 0,
-                                (struct sockaddr*)&from, &fromlen);
-
-            if (bytes > 0) {
-                display_udp((char*)buffer, bytes);
+                if (bytes > 0) {
+                    if (shared_state->scan_type == SCAN_TCP) {
+                        display_tcp((char*)buffer, bytes);
+                    } else {
+                        display_udp((char*)buffer, bytes);
+                    }
+                }
             }
         }
     }
 
-    // Final check for UDP - ports not marked as received are open/filtered
     if (shared_state->scan_type == SCAN_UDP) {
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < TRACKING_SIZE; i++) {
             if (shared_state->port_tracking[i].port > 0 && 
                 shared_state->port_tracking[i].received == 0) {
                 int port = shared_state->port_tracking[i].port;
@@ -535,9 +506,6 @@ void listener() {
     }
 }
 
-/**
- * @brief Sender process - sends packets for each port
- */
 void sender() {
     for (int port = MIN_PORT; port <= MAX_PORT; port++) {
         shared_state->current_port = port;
@@ -548,23 +516,17 @@ void sender() {
             send_udp_packet(port);
         }
 
-        // Progress indicator every 5000 ports
         if (port % 5000 == 0) {
             printf("Scanned %d/%d ports... (%d open)\n", port, MAX_PORT, shared_state->open_count);
             fflush(stdout);
         }
 
-        // Delay to avoid overwhelming the network and allow listener to process
-        usleep(500); // 500 microseconds = 0.5ms
+        usleep(500);  // 0.5ms delay (reduced from 5ms - comment says 1500ms which was wrong)
     }
 
-    // Signal to listener that sender is done
     shared_state->sender_done = 1;
 }
 
-/**
- * @brief Cleanup function
- */
 void cleanup() {
     if (sock_send >= 0) close(sock_send);
     if (sock_recv_tcp >= 0) close(sock_recv_tcp);
@@ -574,16 +536,12 @@ void cleanup() {
     }
 }
 
-/**
- * @brief Main function
- */
 int main(int argc, char *argv[]) {
     int opt;
     char *host = NULL;
     char *scan_type_str = NULL;
     int scan_type = 0;
 
-    // Parse command line arguments
     while ((opt = getopt(argc, argv, "a:t:")) != -1) {
         switch (opt) {
             case 'a':
@@ -608,7 +566,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Validate arguments
     if (host == NULL || scan_type == 0) {
         fprintf(stderr, "Usage: %s -a <host> -t <type>\n", argv[0]);
         fprintf(stderr, "  -a <host>  : target hostname or IP address\n");
@@ -616,7 +573,6 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Check if running as root
     if (geteuid() != 0) {
         fprintf(stderr, "Error: This program requires root privileges (raw sockets)\n");
         fprintf(stderr, "Please run with sudo: sudo %s -a %s -t %s\n", 
@@ -624,20 +580,23 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Resolve hostname to IP
     if (resolve_host(host, target_ip) < 0) {
         fprintf(stderr, "Error: Could not resolve host '%s'\n", host);
         exit(EXIT_FAILURE);
     }
 
-    printf("Starting %s scan on %s (%s)\n", 
-           scan_type == SCAN_TCP ? "TCP" : "UDP", host, target_ip);
+    // FIX: Get local IP address
+    if (get_local_ip(target_ip, local_ip) < 0) {
+        fprintf(stderr, "Error: Could not determine local IP address\n");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Starting %s scan on %s (%s) from %s\n", 
+           scan_type == SCAN_TCP ? "TCP" : "UDP", host, target_ip, local_ip);
     printf("Scanning ports 1-65535...\n\n");
 
-    // Seed random number generator
     srand(time(NULL));
 
-    // Setup shared memory
     shared_state = mmap(NULL, sizeof(scan_state_t),
                        PROT_READ | PROT_WRITE,
                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -647,7 +606,6 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Initialize shared state
     memset(shared_state, 0, sizeof(scan_state_t));
     shared_state->scan_type = scan_type;
     shared_state->sender_done = 0;
@@ -655,7 +613,6 @@ int main(int argc, char *argv[]) {
     shared_state->open_count = 0;
     shared_state->tracking_index = 0;
 
-    // Create raw socket for sending
     sock_send = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock_send < 0) {
         perror("socket send");
@@ -663,7 +620,6 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Enable IP_HDRINCL
     const int on = 1;
     if (setsockopt(sock_send, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0) {
         perror("setsockopt");
@@ -671,7 +627,6 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Create receive socket based on scan type
     if (scan_type == SCAN_TCP) {
         sock_recv_tcp = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
         if (sock_recv_tcp < 0) {
@@ -688,7 +643,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Fork processes
     pid_t process_id = fork();
 
     if (process_id < 0) {
@@ -698,19 +652,13 @@ int main(int argc, char *argv[]) {
     }
 
     if (process_id == 0) {
-        // Child process - listener
         listener();
         cleanup();
         exit(EXIT_SUCCESS);
     } else {
-        // Parent process - sender
         sender();
-        
-        // Wait for listener to finish processing
         wait(NULL);
-        
         printf("\n\nScan complete. Found %d open ports.\n", shared_state->open_count);
-        
         cleanup();
     }
 
